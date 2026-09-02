@@ -1,0 +1,4 @@
+.pio/
+.DS_Store
+src/Secrets.h
+src/Tasks.h
