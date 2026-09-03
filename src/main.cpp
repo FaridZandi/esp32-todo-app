@@ -38,7 +38,7 @@ constexpr int kCardMinHeight = 78, kCardGap = 6;
 constexpr int kTaskTextX = 20, kTaskTextWidth = 136, kTaskTextSize = 2, kTaskLineHeight = 16;
 constexpr int kFilterTop = 576, kFilterHeight = 48, kFilterHitTop = 552;
 constexpr int kAllButtonWidth = 105, kFilterButtonWidth = 55;
-constexpr int kPowerHoldMs = 1000;
+constexpr int kPowerHoldMs = 300;
 constexpr int kBatteryAdcPin = 4;
 constexpr uint32_t kBatteryIntervalMs = 30000;
 constexpr int kTouchDragThreshold = 10;
