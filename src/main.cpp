@@ -32,11 +32,16 @@ constexpr int kBacklightRail = 1, kLcdReset = 5, kSysEn = 6, kTouchIrq = 0;
 constexpr int kBacklightPin = TODO_REVISION == 1 ? 8 : 42;
 constexpr int kTouchIrqPin = TODO_REVISION == 1 ? 42 : 8;
 constexpr int kResetPin = TODO_REVISION == 1 ? 21 : -1;
-constexpr int kHeaderHeight = 96, kRowTop = 104, kRowHeight = 84, kCardHeight = 78, kVisibleRows = 5;
+constexpr int kHeaderHeight = 96, kListTop = 104, kListBottom = 548;
+constexpr int kListHeight = kListBottom - kListTop;
+constexpr int kCardMinHeight = 78, kCardGap = 6;
 constexpr int kTaskTextX = 20, kTaskTextWidth = 136, kTaskTextSize = 2, kTaskLineHeight = 16;
 constexpr int kFilterTop = 576, kFilterHeight = 48, kFilterHitTop = 552;
 constexpr int kAllButtonWidth = 105, kFilterButtonWidth = 55;
 constexpr int kPowerHoldMs = 1000;
+constexpr int kBatteryAdcPin = 4;
+constexpr uint32_t kBatteryIntervalMs = 30000;
+constexpr int kTouchDragThreshold = 10;
 constexpr uint16_t kBackground = 0x1082, kCard = 0x2104, kText = 0xFFFF;
 constexpr uint16_t kMuted = 0x9CD3, kAccent = 0x5E6A, kDoneCard = 0x05C7, kNotDoneCard = 0xC965;
 
@@ -72,23 +77,36 @@ int selected_day_offset = 0;
 time_t today_anchor = 0;
 bool clock_is_synced = false;
 bool ntp_requested = false;
-int first_task = 0;
+int scroll_offset = 0;
 bool filter_active = false;
-uint32_t filtered_out_mask = 0;  // completed tasks captured the last time FILTER was pressed
+uint32_t filtered_out_mask = 0;  // resolved tasks captured the last time FILTER was pressed
 bool stats_page = false;
 enum class StatsMode : uint8_t { Days, Weeks };
 StatsMode stats_mode = StatsMode::Days;
+struct Battery {
+  bool present = false;
+  float volts = 0.0f;
+  uint8_t percent = 0;
+};
+Battery battery;
 bool touch_held = false;
 int16_t touch_x = 0, touch_y = 0;
 int16_t press_x = 0, press_y = 0;
+int16_t last_drag_y = 0;
+bool press_started_in_list = false;
+bool touch_dragging = false;
 uint32_t last_ready_poll = 0, last_touch_read = 0, last_contact_ms = 0;
 uint32_t last_clock_poll = 0;
+uint32_t last_battery_ms = 0;
 bool boot_was_down = false;
 uint32_t boot_changed_ms = 0;
 uint32_t power_pressed_ms = 0;
 
 void render();
 void renderStats();
+int displayedTaskCount();
+int taskAtDisplayIndex(int index);
+Battery readBattery();
 
 time_t buildDate() {
   char month_text[4] = {}; int day = 1, year = 2026;
@@ -169,7 +187,7 @@ void serviceClock() {
     tm current = {}, previous = {};
     localtime_r(&now, &current); localtime_r(&today_anchor, &previous);
     if (now > 1700000000 && (current.tm_year != previous.tm_year || current.tm_yday != previous.tm_yday)) {
-      saveDay(); today_anchor = now; loadDay(); render();
+      saveDay(); today_anchor = now; scroll_offset = 0; loadDay(); render();
     }
     return;
   }
@@ -184,6 +202,15 @@ void serviceClock() {
   clock_is_synced = true;
   loadDay();
   render();
+}
+void serviceBattery() {
+  const uint32_t now = millis();
+  if (now - last_battery_ms < kBatteryIntervalMs) return;
+  last_battery_ms = now;
+  const Battery latest = readBattery();
+  const bool changed = latest.present != battery.present || latest.percent != battery.percent;
+  battery = latest;
+  if (changed || stats_page) render();
 }
 
 bool readReg(uint8_t reg, uint8_t &value) {
@@ -207,6 +234,60 @@ void setBrightness(uint8_t percent) {
   const uint8_t duty = 102 + (std::min<uint8_t>(percent, 100) - 1) * 153 / 99;
   analogWriteResolution(kBacklightPin, 8); analogWriteFrequency(kBacklightPin, 25000);
   analogWrite(kBacklightPin, 255 - duty);  // board PWM is inverted
+}
+Battery readBattery() {
+  // The battery is connected through a 3:1 divider. Several ADC samples avoid
+  // presenting the normal ESP32-S3 voltage noise as a jumping percentage.
+  constexpr int kSamples = 24, kDiscardFirst = 2, kTrimEachEnd = 2;
+  (void)analogRead(kBatteryAdcPin);
+  analogSetPinAttenuation(kBatteryAdcPin, ADC_11db);
+  delay(12);  // let the divider settle after the ADC is enabled
+
+  uint32_t readings[kSamples] = {};
+  int count = 0;
+  bool calibrated = false;
+  for (int sample = 0; sample < kSamples + kDiscardFirst; ++sample) {
+    const uint32_t millivolts = analogReadMilliVolts(kBatteryAdcPin);
+    if (millivolts > 0) calibrated = true;
+    if (sample >= kDiscardFirst) readings[count++] = millivolts;
+  }
+  if (!calibrated) {
+    for (int sample = 0; sample < count; ++sample) {
+      readings[sample] = static_cast<uint32_t>(analogRead(kBatteryAdcPin)) * 3300u / 4095u;
+    }
+  }
+  std::sort(readings, readings + count);
+  uint32_t sum = 0;
+  for (int sample = kTrimEachEnd; sample < count - kTrimEachEnd; ++sample) sum += readings[sample];
+
+  Battery reading;
+  const int kept = count - 2 * kTrimEachEnd;
+  reading.volts = (static_cast<float>(sum) / kept) * 3.0f / 1000.0f;
+  reading.present = reading.volts >= 2.5f && reading.volts <= 4.6f;
+  if (!reading.present) return reading;
+
+  // A lithium cell spends much of its usable life near 3.7 V, so percentage
+  // follows a discharge curve rather than a misleading linear conversion.
+  static constexpr struct { float volts; uint8_t percent; } kCurve[] = {
+      {3.30f, 0},  {3.50f, 5},  {3.60f, 10}, {3.65f, 20}, {3.70f, 30}, {3.75f, 40},
+      {3.79f, 50}, {3.85f, 60}, {3.92f, 70}, {4.00f, 80}, {4.10f, 90}, {4.15f, 100},
+  };
+  constexpr int kPoints = sizeof(kCurve) / sizeof(kCurve[0]);
+  if (reading.volts <= kCurve[0].volts) {
+    reading.percent = 0;
+  } else if (reading.volts >= kCurve[kPoints - 1].volts) {
+    reading.percent = 100;
+  } else {
+    for (int point = 1; point < kPoints; ++point) {
+      if (reading.volts > kCurve[point].volts) continue;
+      const float range = kCurve[point].volts - kCurve[point - 1].volts;
+      const float ratio = (reading.volts - kCurve[point - 1].volts) / range;
+      reading.percent = kCurve[point - 1].percent +
+          static_cast<uint8_t>(ratio * (kCurve[point].percent - kCurve[point - 1].percent));
+      break;
+    }
+  }
+  return reading;
 }
 
 void flush() { panel->draw16bitRGBBitmap(0, 0, screen->getFramebuffer(), kPanelW, kPanelH); }
@@ -242,11 +323,14 @@ int taskLineCount(const char *text) {
   while (*text) { text = nextTaskLine(text, line, sizeof(line)); ++lines; }
   return lines;
 }
-void drawTaskLabel(const char *text, int y, uint16_t color) {
+int cardHeightForTask(int task) {
+  return std::max(kCardMinHeight, taskLineCount(kTasks[task]) * kTaskLineHeight + 24);
+}
+void drawTaskLabel(const char *text, int y, int card_height, uint16_t color) {
   const int lines = taskLineCount(text);
   // The default Arduino_GFX font cursor is its top-left corner, not a baseline.
   // Centre the complete text block in the card.
-  int top = y + (kCardHeight - lines * kTaskLineHeight) / 2;
+  int top = y + (card_height - lines * kTaskLineHeight) / 2;
   char line[20];
   screen->setFont(nullptr); screen->setTextColor(color); screen->setTextSize(kTaskTextSize);
   screen->setTextWrap(false);
@@ -259,6 +343,50 @@ void drawTaskLabel(const char *text, int y, uint16_t color) {
 void dayLabel(char *out, size_t size) {
   tm date = {}; const time_t selected = selectedDate(); localtime_r(&selected, &date);
   strftime(out, size, "%a %b %e", &date);
+}
+int displayedContentHeight() {
+  int height = 0;
+  for (int index = 0; index < displayedTaskCount(); ++index) {
+    const int task = taskAtDisplayIndex(index);
+    if (task < 0) break;
+    height += cardHeightForTask(task) + kCardGap;
+  }
+  return height ? height - kCardGap : 0;
+}
+int maximumScrollOffset() { return std::max(0, displayedContentHeight() - kListHeight); }
+void clampScrollOffset() { scroll_offset = std::clamp(scroll_offset, 0, maximumScrollOffset()); }
+int taskAtListY(int y) {
+  const int content_y = y - kListTop + scroll_offset;
+  int top = 0;
+  for (int index = 0; index < displayedTaskCount(); ++index) {
+    const int task = taskAtDisplayIndex(index);
+    if (task < 0) break;
+    const int height = cardHeightForTask(task);
+    if (content_y >= top && content_y < top + height) return task;
+    top += height + kCardGap;
+  }
+  return -1;
+}
+uint16_t batteryColor() {
+  if (!battery.present) return kMuted;
+  if (battery.percent <= 15) return kNotDoneCard;
+  if (battery.percent <= 35) return 0xFD20;
+  return kText;
+}
+void drawBattery(int x, int y) {
+  const uint16_t color = batteryColor();
+  char percent[5];
+  if (battery.present) snprintf(percent, sizeof(percent), "%u%%", battery.percent);
+  else strcpy(percent, "--");
+  label(percent, x - strlen(percent) * 6 - 3, y + 1, color, 1);
+  screen->drawRoundRect(x, y, 17, 10, 2, color);
+  screen->fillRect(x + 17, y + 3, 2, 4, color);
+  if (battery.present) {
+    const int fill = std::max(1, battery.percent * 13 / 100);
+    screen->fillRect(x + 2, y + 2, fill, 6, color);
+  } else {
+    screen->drawLine(x + 3, y + 7, x + 13, y + 2, color);
+  }
 }
 void headerButton(int x, const char *text, bool highlighted = false) {
   constexpr int kButtonY = 45, kButtonW = 52, kButtonH = 43;
@@ -292,7 +420,11 @@ void renderStats() {
   screen->fillScreen(kBackground);
   screen->fillRect(0, 0, 132, kStatsHeight, 0x0821);
   char date[16]; dayLabel(date, sizeof(date));
-  label("STATS", 20, 14, kText, 2);
+  label("STATS", 12, 9, kText, 2);
+  char battery_text[20];
+  if (battery.present) snprintf(battery_text, sizeof(battery_text), "BAT %u%% %.2fV", battery.percent, battery.volts);
+  else snprintf(battery_text, sizeof(battery_text), "BATTERY --");
+  label(battery_text, 12, 31, batteryColor(), 1);
   statsTab(44, "DAY", stats_mode == StatsMode::Days);
   statsTab(96, "WEEK", stats_mode == StatsMode::Weeks);
   screen->fillRoundRect(12, 151, 7, 7, 2, kDoneCard);
@@ -363,27 +495,40 @@ void filterButton(int x, int width, const char *text, bool selected, bool enable
 }
 void render() {
   if (stats_page) { renderStats(); return; }
+  clampScrollOffset();
   screen->fillScreen(kBackground);
+  const int displayed = displayedTaskCount();
+  int card_y = kListTop - scroll_offset;
+  for (int index = 0; index < displayed; ++index) {
+    const int task = taskAtDisplayIndex(index);
+    if (task < 0) break;
+    const int card_height = cardHeightForTask(task);
+    if (card_y < kListBottom && card_y + card_height > kListTop) {
+      const uint16_t card_color = taskDone(task) ? kDoneCard : (taskNotDone(task) ? kNotDoneCard : kCard);
+      screen->fillRoundRect(8, card_y, 156, card_height, 8, card_color);
+      drawTaskLabel(kTasks[task], card_y, card_height, kText);
+    }
+    card_y += card_height + kCardGap;
+  }
+
+  // Cards may be partly above or below the viewport while dragging. Redrawing
+  // these fixed regions afterwards clips them without a costly extra canvas.
   screen->fillRect(0, 0, kWidth, kHeaderHeight, 0x0821);
+  screen->fillRect(0, kHeaderHeight, kWidth, kListTop - kHeaderHeight, kBackground);
   char date[16]; dayLabel(date, sizeof(date));
-  label(date, (kWidth - strlen(date) * 12) / 2, 13, kText, 2);
+  label(date, std::max(2, (122 - static_cast<int>(strlen(date)) * 12) / 2), 13, kText, 2);
+  drawBattery(149, 17);
   headerButton(3, "PREV");
   headerButton(60, "TODAY", selected_day_offset == 0);
   headerButton(117, "NEXT");
-  const int displayed = displayedTaskCount();
-  for (int row = 0; row < kVisibleRows; ++row) {
-    const int task = taskAtDisplayIndex(first_task + row);
-    if (task < 0) break;
-    const int y = kRowTop + row * kRowHeight;
-    const uint16_t card_color = taskDone(task) ? kDoneCard : (taskNotDone(task) ? kNotDoneCard : kCard);
-    screen->fillRoundRect(8, y, 156, kCardHeight, 8, card_color);
-    drawTaskLabel(kTasks[task], y, kText);
-  }
-  constexpr int kListHeight = kVisibleRows * kRowHeight - 6;
-  const int bar_height = displayed ? std::min(kListHeight, std::max(18, (kVisibleRows * kListHeight) / displayed)) : kListHeight;
-  const int max_first = std::max(0, displayed - kVisibleRows);
-  const int bar_y = kRowTop + (max_first ? first_task * (kListHeight - bar_height) / max_first : 0);
-  screen->fillRoundRect(166, kRowTop, 3, kListHeight, 1, 0x2945);
+  screen->fillRect(0, kListBottom, kWidth, kHeight - kListBottom, kBackground);
+
+  const int content_height = displayedContentHeight();
+  const int max_scroll = maximumScrollOffset();
+  const int bar_height = content_height > kListHeight
+      ? std::max(24, kListHeight * kListHeight / content_height) : kListHeight;
+  const int bar_y = kListTop + (max_scroll ? scroll_offset * (kListHeight - bar_height) / max_scroll : 0);
+  screen->fillRoundRect(166, kListTop, 3, kListHeight, 1, 0x2945);
   screen->fillRoundRect(166, bar_y, 3, bar_height, 1, kAccent);
   if (filter_active && displayed == 0) label("FILTERED LIST IS EMPTY", 22, 330, kText, 1);
   const bool can_filter = hasMarkedDisplayedTask();
@@ -411,9 +556,9 @@ bool readTouch(bool &down) {
   }
   down = true; return true;
 }
-void finishTouch(int start_x, int start_y, int end_x, int end_y) {
+void finishTouch(int start_x, int start_y, int end_x, int end_y, bool was_drag) {
   if (stats_page) {
-    if (std::abs(end_y - start_y) <= 18 && start_x <= 132) {
+    if (!was_drag && std::abs(end_y - start_y) <= 18 && start_x <= 132) {
       if (start_y >= 40 && start_y <= 90) stats_mode = StatsMode::Days;
       else if (start_y >= 92 && start_y <= 144) stats_mode = StatsMode::Weeks;
       else return;
@@ -421,18 +566,14 @@ void finishTouch(int start_x, int start_y, int end_x, int end_y) {
     }
     return;
   }
-  const int drag_y = end_y - start_y;
-  const int max_first = std::max(0, displayedTaskCount() - kVisibleRows);
-  if (start_y >= kRowTop && std::abs(drag_y) > 24) {
-    if (drag_y < 0) first_task = std::min(first_task + 1, max_first);
-    else first_task = std::max(first_task - 1, 0);
-  } else if (std::abs(drag_y) <= 18 && start_y >= 43 && start_y < kHeaderHeight) {
-    if (start_x < 57) { saveDay(); --selected_day_offset; first_task = 0; loadDay(); }
-    else if (start_x < 115) { saveDay(); selected_day_offset = 0; first_task = 0; loadDay(); }
-    else { saveDay(); ++selected_day_offset; first_task = 0; loadDay(); }
+  if (was_drag) return;  // the list already followed this gesture live
+  if (std::abs(end_y - start_y) <= 18 && start_y >= 43 && start_y < kHeaderHeight) {
+    if (start_x < 57) { saveDay(); --selected_day_offset; scroll_offset = 0; loadDay(); }
+    else if (start_x < 115) { saveDay(); selected_day_offset = 0; scroll_offset = 0; loadDay(); }
+    else { saveDay(); ++selected_day_offset; scroll_offset = 0; loadDay(); }
     filter_active = false;
     filtered_out_mask = 0;
-  } else if (std::abs(drag_y) <= 18 && start_y >= kFilterHitTop) {
+  } else if (std::abs(end_y - start_y) <= 18 && start_y >= kFilterHitTop) {
     if (start_x < 113) {
       filter_active = false;
       filtered_out_mask = 0;
@@ -442,12 +583,10 @@ void finishTouch(int start_x, int start_y, int end_x, int end_y) {
     } else {
       return;
     }
-    first_task = 0;
-  } else if (std::abs(drag_y) <= 18 && start_y >= kRowTop && start_y < kFilterHitTop) {
-    const int row = (start_y - kRowTop) / kRowHeight;
-    if (start_y >= kRowTop + row * kRowHeight + kCardHeight) return;  // card gap: no action
-    const int task = taskAtDisplayIndex(first_task + row);
-    if (task < 0) return;
+    scroll_offset = 0;
+  } else if (std::abs(end_y - start_y) <= 18 && start_y >= kListTop && start_y < kListBottom) {
+    const int task = taskAtListY(end_y);
+    if (task < 0) return;  // a gap between cards is deliberately inert
     cycleTaskState(task);
     saveDay();
   } else return;
@@ -490,7 +629,7 @@ void powerDown() {
 void toggleStats() {
   stats_page = !stats_page;
   screen = stats_page ? stats_screen : portrait_screen;
-  touch_held = false;
+  touch_held = false; press_started_in_list = false; touch_dragging = false;
   render();
 }
 void handleButtons() {
@@ -533,12 +672,15 @@ void setup() {
     log_e("display or PSRAM initialization failed"); return;
   }
   screen = portrait_screen;
+  battery = readBattery();
+  last_battery_ms = millis();
   expanderOutput(kBacklightRail, true); setBrightness(85); render();
 }
 
 void loop() {
   handleButtons();
   serviceClock();
+  serviceBattery();
   const uint32_t now = millis();
   if (now - last_ready_poll < 5) return;
   last_ready_poll = now;
@@ -550,13 +692,32 @@ void loop() {
   const bool read_ok = readTouch(down);
   if (read_ok && down) {
     last_contact_ms = now;
-    if (!touch_held) { touch_held = true; press_x = touch_x; press_y = touch_y; }
+    if (!touch_held) {
+      touch_held = true;
+      press_x = touch_x; press_y = touch_y; last_drag_y = touch_y;
+      press_started_in_list = !stats_page && touch_y >= kListTop && touch_y < kListBottom;
+      touch_dragging = false;
+    } else if (press_started_in_list) {
+      if (!touch_dragging && std::abs(touch_y - press_y) >= kTouchDragThreshold) {
+        touch_dragging = true;
+        last_drag_y = press_y;
+      }
+      if (touch_dragging) {
+        const int before = scroll_offset;
+        scroll_offset -= touch_y - last_drag_y;
+        clampScrollOffset();
+        last_drag_y = touch_y;
+        if (scroll_offset != before) render();
+      }
+    }
     return;
   }
   // The controller occasionally skips a report while a finger is down.  Wait
   // briefly before treating it as a release so ordinary taps remain reliable.
   if (touch_held && now - last_contact_ms > 60) {
     touch_held = false;
-    finishTouch(press_x, press_y, touch_x, touch_y);
+    finishTouch(press_x, press_y, touch_x, touch_y, touch_dragging);
+    press_started_in_list = false;
+    touch_dragging = false;
   }
 }
