@@ -125,6 +125,7 @@ TaskState taskStateInMask(uint32_t mask, int task) {
 TaskState taskState(int task) { return taskStateInMask(task_mask, task); }
 bool taskDoneInMask(uint32_t mask, int task) { return taskStateInMask(mask, task) == TaskState::Done; }
 bool taskNotDoneInMask(uint32_t mask, int task) { return taskStateInMask(mask, task) == TaskState::NotDone; }
+bool taskMarkedInMask(uint32_t mask, int task) { return taskStateInMask(mask, task) != TaskState::Default; }
 bool taskDone(int task) { return taskState(task) == TaskState::Done; }
 bool taskNotDone(int task) { return taskState(task) == TaskState::NotDone; }
 int completedInMask(uint32_t mask) {
@@ -334,20 +335,22 @@ void renderStats() {
 }
 int displayedTaskCount() {
   if (!filter_active) return kTaskCount;
-  return kTaskCount - completedInMask(filtered_out_mask);
+  int displayed = 0;
+  for (int task = 0; task < kTaskCount; ++task) if (!taskMarkedInMask(filtered_out_mask, task)) ++displayed;
+  return displayed;
 }
 int taskAtDisplayIndex(int index) {
   for (int task = 0; task < kTaskCount; ++task) {
-    if (filter_active && taskDoneInMask(filtered_out_mask, task)) continue;
+    if (filter_active && taskMarkedInMask(filtered_out_mask, task)) continue;
     if (index-- == 0) return task;
   }
   return -1;
 }
-bool hasCompletedDisplayedTask() {
+bool hasMarkedDisplayedTask() {
   const int displayed = displayedTaskCount();
   for (int index = 0; index < displayed; ++index) {
     const int task = taskAtDisplayIndex(index);
-    if (task >= 0 && taskDone(task)) return true;
+    if (task >= 0 && taskMarkedInMask(task_mask, task)) return true;
   }
   return false;
 }
@@ -383,7 +386,7 @@ void render() {
   screen->fillRoundRect(166, kRowTop, 3, kListHeight, 1, 0x2945);
   screen->fillRoundRect(166, bar_y, 3, bar_height, 1, kAccent);
   if (filter_active && displayed == 0) label("FILTERED LIST IS EMPTY", 22, 330, kText, 1);
-  const bool can_filter = hasCompletedDisplayedTask();
+  const bool can_filter = hasMarkedDisplayedTask();
   filterButton(4, kAllButtonWidth, "ALL", !filter_active);
   // FILTER is an action that refreshes the hidden-task snapshot, not a mode.
   filterButton(113, kFilterButtonWidth, "FILTER", false, can_filter);
@@ -433,7 +436,7 @@ void finishTouch(int start_x, int start_y, int end_x, int end_y) {
     if (start_x < 113) {
       filter_active = false;
       filtered_out_mask = 0;
-    } else if (hasCompletedDisplayedTask()) {
+    } else if (hasMarkedDisplayedTask()) {
       filter_active = true;
       filtered_out_mask = task_mask;
     } else {
