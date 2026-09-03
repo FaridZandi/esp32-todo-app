@@ -6,6 +6,7 @@ The initial task list is deliberately hardcoded. Tap anywhere on a task card to
 check it off, and swipe the task list up or down to scroll. The display is used
 in its natural 172 × 640 portrait orientation. The arrows move between
 independent, persistent day views. Completed tasks turn their whole card green.
+Each tap cycles a task through default, done (green), and not done (red).
 
 Checklist state is stored in the ESP32's NVS flash and survives resets and power
 loss. To make dates real calendar dates, copy `src/Secrets.example.h` to

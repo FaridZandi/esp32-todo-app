@@ -38,7 +38,7 @@ constexpr int kFilterTop = 576, kFilterHeight = 48, kFilterHitTop = 552;
 constexpr int kAllButtonWidth = 105, kFilterButtonWidth = 55;
 constexpr int kPowerHoldMs = 1000;
 constexpr uint16_t kBackground = 0x1082, kCard = 0x2104, kText = 0xFFFF;
-constexpr uint16_t kMuted = 0x9CD3, kAccent = 0x5E6A, kDoneCard = 0x05C7;
+constexpr uint16_t kMuted = 0x9CD3, kAccent = 0x5E6A, kDoneCard = 0x05C7, kNotDoneCard = 0xC965;
 
 class PsramCanvas final : public Arduino_Canvas {
  public:
@@ -65,6 +65,7 @@ PsramCanvas *screen;
 #error "Copy src/Tasks.example.h to src/Tasks.h and add your private tasks."
 #endif
 constexpr int kTaskCount = sizeof(kTasks) / sizeof(kTasks[0]);
+static_assert(kTaskCount <= 16, "Two-bit task states fit up to 16 tasks in NVS.");
 Preferences preferences;
 uint32_t task_mask = 0;
 int selected_day_offset = 0;
@@ -117,11 +118,29 @@ void dayKeyFor(time_t date, char *out, size_t size) {
 void dayKey(char *out, size_t size) {
   dayKeyFor(selectedDate(), out, size);
 }
-bool taskDone(int task) { return task_mask & (1u << task); }
+enum class TaskState : uint8_t { Default = 0, Done = 1, NotDone = 2 };
+TaskState taskStateInMask(uint32_t mask, int task) {
+  return static_cast<TaskState>((mask >> (task * 2)) & 0x3u);
+}
+TaskState taskState(int task) { return taskStateInMask(task_mask, task); }
+bool taskDoneInMask(uint32_t mask, int task) { return taskStateInMask(mask, task) == TaskState::Done; }
+bool taskNotDoneInMask(uint32_t mask, int task) { return taskStateInMask(mask, task) == TaskState::NotDone; }
+bool taskDone(int task) { return taskState(task) == TaskState::Done; }
+bool taskNotDone(int task) { return taskState(task) == TaskState::NotDone; }
 int completedInMask(uint32_t mask) {
   int complete = 0;
-  for (int task = 0; task < kTaskCount; ++task) if (mask & (1u << task)) ++complete;
+  for (int task = 0; task < kTaskCount; ++task) if (taskDoneInMask(mask, task)) ++complete;
   return complete;
+}
+int notDoneInMask(uint32_t mask) {
+  int missed = 0;
+  for (int task = 0; task < kTaskCount; ++task) if (taskNotDoneInMask(mask, task)) ++missed;
+  return missed;
+}
+void cycleTaskState(int task) {
+  const uint32_t shift = task * 2;
+  const TaskState next = static_cast<TaskState>((static_cast<uint8_t>(taskState(task)) + 1) % 3);
+  task_mask = (task_mask & ~(0x3u << shift)) | (static_cast<uint32_t>(next) << shift);
 }
 uint32_t maskAtOffset(int offset) {
   char key[12]; dayKeyFor(dateAtOffset(offset), key, sizeof(key));
@@ -255,13 +274,16 @@ void statsTab(int y, const char *text, bool selected) {
   screen->drawRoundRect(kTabX, y, kTabW, kTabH, 7, selected ? kText : kMuted);
   label(text, kTabX + (kTabW - strlen(text) * 6) / 2, y + 17, kText, 1);
 }
-void statsBar(int x, int width, int value, int maximum, const char *caption) {
+void statsBar(int x, int width, int done, int not_done, int maximum, const char *caption) {
   constexpr int kPlotTop = 20, kPlotBottom = 140;
-  const int height = maximum ? value * (kPlotBottom - kPlotTop) / maximum : 0;
+  const int done_height = maximum ? done * (kPlotBottom - kPlotTop) / maximum : 0;
+  const int not_done_height = maximum ? not_done * (kPlotBottom - kPlotTop) / maximum : 0;
   screen->fillRoundRect(x, kPlotTop, width, kPlotBottom - kPlotTop, 4, kCard);
-  if (height) screen->fillRoundRect(x, kPlotBottom - height, width, height, 4, kDoneCard);
-  char number[8]; snprintf(number, sizeof(number), "%d", value);
-  const int number_y = std::max(kPlotTop + 3, kPlotBottom - height - 10);
+  if (done_height) screen->fillRoundRect(x, kPlotBottom - done_height, width, done_height, 4, kDoneCard);
+  if (not_done_height) screen->fillRoundRect(x, kPlotBottom - done_height - not_done_height, width, not_done_height, 4, kNotDoneCard);
+  char number[12]; snprintf(number, sizeof(number), "%d/%d", done, not_done);
+  const int used_height = done_height + not_done_height;
+  const int number_y = std::max(kPlotTop + 3, kPlotBottom - used_height - 10);
   label(number, x + (width - strlen(number) * 6) / 2, number_y, kText, 1);
   label(caption, x + (width - strlen(caption) * 6) / 2, 151, kMuted, 1);
 }
@@ -272,16 +294,21 @@ void renderStats() {
   label("STATS", 20, 14, kText, 2);
   statsTab(44, "DAY", stats_mode == StatsMode::Days);
   statsTab(96, "WEEK", stats_mode == StatsMode::Weeks);
-  label("BOOT: BACK", 23, 153, kMuted, 1);
+  screen->fillRoundRect(12, 151, 7, 7, 2, kDoneCard);
+  label("DONE", 23, 151, kMuted, 1);
+  screen->fillRoundRect(70, 151, 7, 7, 2, kNotDoneCard);
+  label("NOT", 81, 151, kMuted, 1);
   label(date, 145, 5, kMuted, 1);
 
   if (stats_mode == StatsMode::Days) {
     for (int bar = 0; bar < 7; ++bar) {
       const int offset = selected_day_offset + bar - 6;
-      const int complete = completedInMask(maskAtOffset(offset));
+      const uint32_t mask = maskAtOffset(offset);
+      const int complete = completedInMask(mask);
+      const int missed = notDoneInMask(mask);
       tm local = {}; const time_t day = dateAtOffset(offset); localtime_r(&day, &local);
       char caption[4]; strftime(caption, sizeof(caption), "%a", &local);
-      statsBar(146 + bar * 68, 52, complete, kTaskCount, caption);
+      statsBar(146 + bar * 68, 52, complete, missed, kTaskCount, caption);
     }
   } else {
     tm selected = {}; const time_t anchor = selectedDate(); localtime_r(&anchor, &selected);
@@ -290,13 +317,17 @@ void renderStats() {
       const int weeks_ago = 5 - bar;
       const int start = selected_day_offset - monday_offset - weeks_ago * 7;
       const int days_in_week = weeks_ago == 0 ? monday_offset + 1 : 7;
-      int complete = 0;
-      for (int day = 0; day < days_in_week; ++day) complete += completedInMask(maskAtOffset(start + day));
+      int complete = 0, missed = 0;
+      for (int day = 0; day < days_in_week; ++day) {
+        const uint32_t mask = maskAtOffset(start + day);
+        complete += completedInMask(mask);
+        missed += notDoneInMask(mask);
+      }
       const int possible = days_in_week * kTaskCount;
       char caption[8];
       if (weeks_ago == 0) snprintf(caption, sizeof(caption), "THIS");
       else snprintf(caption, sizeof(caption), "-%dw", weeks_ago);
-      statsBar(150 + bar * 76, 60, complete, possible, caption);
+      statsBar(150 + bar * 76, 60, complete, missed, possible, caption);
     }
   }
   flush();
@@ -307,7 +338,7 @@ int displayedTaskCount() {
 }
 int taskAtDisplayIndex(int index) {
   for (int task = 0; task < kTaskCount; ++task) {
-    if (filter_active && (filtered_out_mask & (1u << task))) continue;
+    if (filter_active && taskDoneInMask(filtered_out_mask, task)) continue;
     if (index-- == 0) return task;
   }
   return -1;
@@ -340,8 +371,9 @@ void render() {
   for (int row = 0; row < kVisibleRows; ++row) {
     const int task = taskAtDisplayIndex(first_task + row);
     if (task < 0) break;
-    const int y = kRowTop + row * kRowHeight; const bool done = taskDone(task);
-    screen->fillRoundRect(8, y, 156, kCardHeight, 8, done ? kDoneCard : kCard);
+    const int y = kRowTop + row * kRowHeight;
+    const uint16_t card_color = taskDone(task) ? kDoneCard : (taskNotDone(task) ? kNotDoneCard : kCard);
+    screen->fillRoundRect(8, y, 156, kCardHeight, 8, card_color);
     drawTaskLabel(kTasks[task], y, kText);
   }
   constexpr int kListHeight = kVisibleRows * kRowHeight - 6;
@@ -413,7 +445,7 @@ void finishTouch(int start_x, int start_y, int end_x, int end_y) {
     if (start_y >= kRowTop + row * kRowHeight + kCardHeight) return;  // card gap: no action
     const int task = taskAtDisplayIndex(first_task + row);
     if (task < 0) return;
-    task_mask ^= 1u << task;
+    cycleTaskState(task);
     saveDay();
   } else return;
   render();
