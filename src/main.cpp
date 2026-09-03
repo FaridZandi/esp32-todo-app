@@ -108,7 +108,11 @@ time_t dateAtOffset(int offset) {
 time_t selectedDate() { return dateAtOffset(selected_day_offset); }
 void dayKeyFor(time_t date, char *out, size_t size) {
   tm local = {}; localtime_r(&date, &local);
-  strftime(out, size, "d%Y%m%d", &local);  // NVS keys must be 15 characters or shorter
+  char date_key[10];
+  strftime(date_key, sizeof(date_key), "%Y%m%d", &local);
+  // A private task-list version prevents old task positions from leaking into
+  // a replacement list. NVS keys must be 15 characters or shorter.
+  snprintf(out, size, "v%ud%s", kTaskListVersion, date_key);
 }
 void dayKey(char *out, size_t size) {
   dayKeyFor(selectedDate(), out, size);
